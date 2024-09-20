@@ -148,7 +148,7 @@ def main():
             relaxer = Relaxer(Path(args.model))
         elif args.type == "mace":
             relaxer = Relaxer("mace")
-        res_df = relax_run(Path(args.input), relaxer, check_convergence=(not args.skip_check_convergence),
+        res_df = relax_run(args.input, relaxer, check_convergence=(not args.skip_check_convergence),
                            check_duplicate=(not args.skip_check_duplicate))
         res_df.to_json(args.output)
     elif args.command == "submit":

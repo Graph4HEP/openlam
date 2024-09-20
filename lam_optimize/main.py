@@ -16,13 +16,14 @@ from tqdm import tqdm
 import os
 import signal
 import traceback
-
+from glob import glob
+import time
 
 def sigalrm_handler(signum, frame):
     raise TimeoutError("Timeout to relax")
 
 
-def relax_run(fpth: Path, relaxer: Relaxer, fmax: float=1e-4, steps: int=200, traj_file: Path=None, timeout: int=None, check_convergence: bool=True, check_duplicate: bool=False, validate: bool=True):
+def relax_run(fpth: str, relaxer: Relaxer, fmax: float=1e-4, steps: int=200, traj_file: Path=None, timeout: int=None, check_convergence: bool=True, check_duplicate: bool=True, validate: bool=True):
     """
     This is the main relaxation function
 
@@ -39,9 +40,16 @@ def relax_run(fpth: Path, relaxer: Relaxer, fmax: float=1e-4, steps: int=200, tr
     traj_file: Path
         Path to store relaxation trajectory.
     """
+    os.makedirs(f"{fpth}/relaxed/excellent", exist_ok=True)
+    os.makedirs(f"{fpth}/relaxed/good", exist_ok=True)
+    os.makedirs(f"{fpth}/relaxed/fine", exist_ok=True)
+    os.makedirs(f"{fpth}/unconverged", exist_ok=True)
+    os.makedirs(f"{fpth}/processed", exist_ok=True)
     print("\nStart to relax structures.\n")
     relax_results = {}
-    cifs = fpth.rglob("*.cif")
+    st = time.time()
+    count = 0
+    cifs = glob(f"{fpth}*.cif")
     for cif in tqdm(cifs, desc="Relaxing"):
         fn = str(cif).split("/")[-1].split(".")[0]
         try:
@@ -58,79 +66,166 @@ def relax_run(fpth: Path, relaxer: Relaxer, fmax: float=1e-4, steps: int=200, tr
                     outpath = str(os.path.join(str(traj_file),fn ))
                 else:
                     outpath = None
-                result = relaxer.relax(structure, fmax=fmax, steps=steps, traj_file=outpath)
-                relax_results[fn] = {
-                    f"final_structure": result["final_structure"],
-                    "final_energy": result["trajectory"].energies[-1],
-                    "initial_structure": structure.as_dict(),
-                }
-
+                result_temp = relaxer.relax(structure, fmax=0.05, steps=10, traj_file=outpath)
+                atoms = AseAtomsAdaptor.get_atoms(Structure.from_dict(result_temp["final_structure"]))
+                atoms.calc = relaxer.calculator
+                if(np.max(abs(atoms.get_forces()))>1000):
+                    print('hard to converged. skip')
+                    continue
+                structure = Structure.from_dict(result_temp["final_structure"])
+                result = relaxer.relax(structure, fmax=0.05, steps=150, traj_file=outpath)                
+                atoms = AseAtomsAdaptor.get_atoms(Structure.from_dict(result["final_structure"]))
+                atoms.calc = relaxer.calculator
+                if(get_e_form_per_atom(atoms, atoms.get_potential_energy())<-2 and np.max(abs(atoms.get_forces())) < 0.05):
+                    print('excellent case: will continue the relax')
+                    structure = Structure.from_dict(result["final_structure"])
+                    result = relaxer.relax(structure, fmax=fmax, steps=steps, traj_file=outpath)
+                    relax_results[fn] = {
+                        f"final_structure": result["final_structure"],
+                        "final_energy": result["trajectory"].energies[-1],
+                        "initial_structure": structure.as_dict(),
+                    }
+                    atoms = AseAtomsAdaptor.get_atoms(Structure.from_dict(result["final_structure"]))                
+                    atoms.calc = relaxer.calculator
+                    print(get_e_form_per_atom(atoms, atoms.get_potential_energy()), np.max(abs(atoms.get_forces())))
+                    cif_file = f"{fpth}/relaxed/excellent/final-{atoms.symbols}.cif"
+                    ase.io.write(cif_file, atoms, format='cif')
+                    if validate:
+                        try:
+                            validate_cif(cif_file)
+                        except Exception:
+                            traceback.print_exc()
+                            os.remove(cif_file)
+                    if check_duplicate:
+                        energy = atoms.get_potential_energy()
+                        structure = AseAtomsAdaptor.get_structure(atoms)
+                        formula = structure.reduced_formula
+                        for known_structure in CrystalStructure.query(formula=formula):
+                            if (
+                                abs(known_structure.energy - energy)
+                                / max(abs(known_structure.energy), abs(energy))
+                                > 0.05
+                            ):
+                                continue
+                            else:
+                                if MATCHER.fit(known_structure.structure, structure):
+                                    logging.warn("%s: duplicate structure" % atoms.symbols)
+                                    print("%s: duplicate structure" % atoms.symbols)
+                                    try:
+                                        os.remove(cif_file)
+                                    except:
+                                        print('already removed')
+                                        pass
+                                    break                            
+                    os.rename(f'{cif}', f'{fpth}/processed/{fn}.cif')
+                elif(get_e_form_per_atom(atoms, atoms.get_potential_energy())<-1 and 
+                     get_e_form_per_atom(atoms, atoms.get_potential_energy())>-2 and
+                     np.max(abs(atoms.get_forces())) < 0.05):
+                    print('good case: will continue the relax')
+                    structure = Structure.from_dict(result["final_structure"])
+                    result = relaxer.relax(structure, fmax=fmax, steps=steps, traj_file=outpath)
+                    relax_results[fn] = {
+                        f"final_structure": result["final_structure"],
+                        "final_energy": result["trajectory"].energies[-1],
+                        "initial_structure": structure.as_dict(),
+                    }
+                    atoms = AseAtomsAdaptor.get_atoms(Structure.from_dict(result["final_structure"]))
+                    atoms.calc = relaxer.calculator
+                    print(get_e_form_per_atom(atoms, atoms.get_potential_energy()), np.max(abs(atoms.get_forces())))
+                    cif_file = f"{fpth}/relaxed/good/final-{atoms.symbols}.cif"
+                    ase.io.write(cif_file, atoms, format='cif')
+                    if validate:
+                        try:
+                            validate_cif(cif_file)
+                        except Exception:
+                            traceback.print_exc()
+                            os.remove(cif_file)
+                    if check_duplicate:
+                        energy = atoms.get_potential_energy()
+                        structure = AseAtomsAdaptor.get_structure(atoms)
+                        formula = structure.reduced_formula
+                        for known_structure in CrystalStructure.query(formula=formula):
+                            if (
+                                abs(known_structure.energy - energy)
+                                / max(abs(known_structure.energy), abs(energy))
+                                > 0.05
+                            ):
+                                continue
+                            else:
+                                if MATCHER.fit(known_structure.structure, structure):
+                                    logging.warn("%s: duplicate structure" % atoms.symbols)
+                                    print("%s: duplicate structure" % atoms.symbols)
+                                    try:
+                                        os.remove(cif_file)
+                                    except:
+                                        print('already removed')
+                                        pass
+                                    break                            
+                    os.rename(f'{cif}', f'{fpth}/processed/{fn}.cif') 
+                elif(get_e_form_per_atom(atoms, atoms.get_potential_energy())<0.5 and  
+                     get_e_form_per_atom(atoms, atoms.get_potential_energy())>-1 and
+                     np.max(abs(atoms.get_forces())) < 0.05):
+                    print('fine case: will continue the relax')
+                    structure = Structure.from_dict(result["final_structure"])
+                    result = relaxer.relax(structure, fmax=fmax, steps=steps, traj_file=outpath)
+                    relax_results[fn] = {
+                        f"final_structure": result["final_structure"],
+                        "final_energy": result["trajectory"].energies[-1],
+                        "initial_structure": structure.as_dict(),
+                    }
+                    atoms = AseAtomsAdaptor.get_atoms(Structure.from_dict(result["final_structure"]))
+                    atoms.calc = relaxer.calculator
+                    print(get_e_form_per_atom(atoms, atoms.get_potential_energy()), np.max(abs(atoms.get_forces())))
+                    cif_file = f"{fpth}/relaxed/fine/final-{atoms.symbols}.cif"
+                    ase.io.write(cif_file, atoms, format='cif')
+                    if validate:
+                        try:
+                            validate_cif(cif_file)
+                        except Exception:
+                            traceback.print_exc()
+                            os.remove(cif_file)
+                    if check_duplicate:
+                        energy = atoms.get_potential_energy()
+                        structure = AseAtomsAdaptor.get_structure(atoms)
+                        formula = structure.reduced_formula
+                        for known_structure in CrystalStructure.query(formula=formula):
+                            if (
+                                abs(known_structure.energy - energy)
+                                / max(abs(known_structure.energy), abs(energy))
+                                > 0.05
+                            ):
+                                continue
+                            else:
+                                if MATCHER.fit(known_structure.structure, structure):
+                                    logging.warn("%s: duplicate structure" % atoms.symbols)
+                                    print("%s: duplicate structure" % atoms.symbols)
+                                    try:
+                                        os.remove(cif_file)
+                                    except:
+                                        print('already removed')
+                                        pass
+                                    break                            
+                    os.rename(f'{cif}', f'{fpth}/processed/{fn}.cif')
+                else:
+                    print('not converged case: will move the raw cif away')
+                    try:
+                        os.rename(f'{cif}', f'{fpth}/unconverged/{fn}.cif')
+                    except:
+                        print('code wrong, please check')
+                        pass
             except Exception as exc:
+                    print('failed to relax')
                     logging.warn(f"Failed to relax {fn}: {exc!r}")
             finally:
                 if timeout is not None:
                     signal.alarm(0)
         else:
             pass
+        count += 1
+        print(f'used time: {time.time()-st:.1f}, left time: {(time.time()-st)/count*(len(cifs)-count):.1f}')
+        print(f'fname: {cif}, count: {count}')
     df_out = pd.DataFrame(relax_results).T
     print("\nSaved to df.\n")
-
-    atoms_list = []
-    for i in df_out.index:
-        atoms = AseAtomsAdaptor.get_atoms(Structure.from_dict(df_out.loc[i, "final_structure"]))
-        atoms_list.append(atoms)
-
-    os.makedirs("unconverged", exist_ok=True)
-    if check_convergence:
-        new_atoms_list = []
-        unconverged = []
-        for i, atoms in enumerate(atoms_list):
-            atoms.calc = relaxer.calculator
-            if get_e_form_per_atom(atoms, atoms.get_potential_energy()) > 0:
-                logging.warn("%s: energy not relaxed" % atoms.symbols)
-                unconverged.append(Structure.from_dict(df_out.loc[df_out.index[i], "initial_structure"]))
-            elif np.max(abs(atoms.get_forces())) > 0.05:
-                logging.warn("%s: forces not relaxed" % atoms.symbols)
-                unconverged.append(Structure.from_dict(df_out.loc[df_out.index[i], "initial_structure"]))
-            else:
-                new_atoms_list.append(atoms)
-        atoms_list = new_atoms_list
-        for structure in unconverged:
-            atoms = AseAtomsAdaptor.get_atoms(structure)
-            ase.io.write(f"unconverged/initial-{atoms.symbols}.cif", atoms, format='cif')
-
-    if check_duplicate:
-        new_atoms_list = []
-        for atoms in atoms_list:
-            atoms.calc = relaxer.calculator
-            energy = atoms.get_potential_energy()
-            structure = AseAtomsAdaptor.get_structure(atoms)
-            formula = structure.reduced_formula
-            for known_structure in CrystalStructure.query(formula=formula):
-                if (
-                    abs(known_structure.energy - energy)
-                    / max(abs(known_structure.energy), abs(energy))
-                    > 0.05
-                ):
-                    continue
-                else:
-                    if MATCHER.fit(known_structure.structure, structure):
-                        logging.warn("%s: duplicate structure" % atoms.symbols)
-                        break
-            else:
-                new_atoms_list.append(atoms)
-        atoms_list = new_atoms_list
-
-    os.makedirs("relaxed", exist_ok=True)
-    for atoms in atoms_list:
-        cif_file = f"relaxed/final-{atoms.symbols}.cif"
-        ase.io.write(cif_file, atoms, format='cif')
-        if validate:
-            try:
-                validate_cif(cif_file)
-            except Exception:
-                traceback.print_exc()
-                os.remove(cif_file)
 
     return df_out
 
